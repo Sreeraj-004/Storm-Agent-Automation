@@ -30,6 +30,9 @@ SNOW_USERNAME = os.getenv("SNOW_USERNAME")
 SNOW_PASSWORD = os.getenv("SNOW_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+SCHEDULED_STATE_VALUE = os.getenv("SNOW_SCHEDULED_STATE_VALUE")
+CANCELED_STATE_VALUE = os.getenv("SNOW_CANCELLED_STATE_VALUE")
+
 FREEZE_NOTE = "Change freeze applied until further notice."
 HIGH_RISK_NOTE = (
     "Analyzed the risk of the change, requested for approval "
@@ -66,7 +69,7 @@ async def fetch_changes(start: datetime, end: datetime):
             "sys_id,number,short_description,description,type,state,"
             "approval,start_date,end_date,justification,"
             "implementation_plan,risk_impact_analysis,"
-            "backout_plan,test_plan"
+            "backout_plan,test_plan,on_hold,on_hold_reason"
         ),
         "sysparm_display_value": "true",
         "sysparm_limit": "100",
@@ -227,10 +230,14 @@ Change record:
         }
 
 
+
+
 async def update_exception_decision_work_note(
     sys_id: str,
     decision: str,
 ):
+    """Release the hold before applying an exception decision."""
+
     if decision not in ("approve", "reject"):
         raise ValueError("Invalid exception decision.")
 
@@ -239,22 +246,27 @@ async def update_exception_decision_work_note(
         SNOW_USERNAME,
         SNOW_PASSWORD,
     ]):
-        raise HTTPException(
-            status_code=500,
-            detail="ServiceNow configuration is incomplete.",
-        )
+        raise RuntimeError("ServiceNow configuration is incomplete.")
 
     if decision == "approve":
+        target_state = SCHEDULED_STATE_VALUE
+        expected_state = str(SCHEDULED_STATE_VALUE)
         note = (
             "Exception approved by Change Manager. "
-            "Approved to proceed as per the scheduled "
-            "implementation window."
+            "Storm Mode hold released. Approved to proceed "
+            "as per the scheduled implementation window."
         )
     else:
+        target_state = CANCELED_STATE_VALUE
+        expected_state = str(CANCELED_STATE_VALUE)
         note = (
             "Exception rejected by Change Manager. "
-            "Not approved to proceed; keep the change "
-            "frozen until further notice."
+            "Change canceled and will not proceed as scheduled."
+        )
+
+    if not target_state:
+        raise RuntimeError(
+            f"State value is not configured for decision: {decision}"
         )
 
     url = (
@@ -262,23 +274,91 @@ async def update_exception_decision_work_note(
         f"change_request/{sys_id}"
     )
 
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    auth = (SNOW_USERNAME, SNOW_PASSWORD)
+
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await snow_request_with_retry(
+        # Step 1: Release the Storm Mode hold.
+        release_response = await snow_request_with_retry(
             client,
             "PATCH",
             url,
-            auth=(SNOW_USERNAME, SNOW_PASSWORD),
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json={"work_notes": note},
+            auth=auth,
+            headers=headers,
+            json={"on_hold": False},
         )
-        response.raise_for_status()
+        release_response.raise_for_status()
 
-    return {"status": "updated", "decision": decision}
-    
+        # Verify that ServiceNow has released the hold.
+        verify_hold_response = await snow_request_with_retry(
+            client,
+            "GET",
+            url,
+            auth=auth,
+            headers={"Accept": "application/json"},
+            params={
+                "sysparm_fields": "sys_id,on_hold",
+                "sysparm_display_value": "false",
+            },
+        )
+        verify_hold_response.raise_for_status()
 
+        record = verify_hold_response.json().get("result", {})
+
+        if str(record.get("on_hold", "")).lower() != "false":
+            raise RuntimeError(
+                "ServiceNow did not confirm that the hold was released."
+            )
+
+        # Step 2: Apply the decision and add its work note.
+        decision_response = await snow_request_with_retry(
+            client,
+            "PATCH",
+            url,
+            auth=auth,
+            headers=headers,
+            json={
+                "state": target_state,
+                "work_notes": note,
+            },
+        )
+        decision_response.raise_for_status()
+
+        # Step 3: Verify the final state and hold flag.
+        verify_response = await snow_request_with_retry(
+            client,
+            "GET",
+            url,
+            auth=auth,
+            headers={"Accept": "application/json"},
+            params={
+                "sysparm_fields": "sys_id,state,on_hold",
+                "sysparm_display_value": "false",
+            },
+        )
+        verify_response.raise_for_status()
+
+        final_record = verify_response.json().get("result", {})
+
+        actual_state = str(final_record.get("state", ""))
+        actual_hold = str(final_record.get("on_hold", "")).lower()
+
+        if actual_state != expected_state or actual_hold != "false":
+            raise RuntimeError(
+                "ServiceNow did not confirm the requested final state "
+                "and released hold."
+            )
+
+    return {
+        "status": "updated",
+        "decision": decision,
+        "state": actual_state,
+        "on_hold": False,
+        "work_note_status": "submitted",
+    }
 
 
 async def update_change_work_notes(
@@ -382,6 +462,30 @@ async def process_storm_changes(
             "risk_assessment": assessment,
             "work_note_status": note_status,
         }
+        try:
+            hold_result = await put_change_on_hold(change)
+
+            item["hold_status"] = hold_result["status"]
+            item["hold_result"] = hold_result
+
+            if hold_result["status"] == "failed":
+                update_failures.append({
+                    "number": change.get("number"),
+                    "status": "hold_update_failed",
+                })
+
+        except Exception:
+            logger.exception(
+                "Failed to put change %s on hold",
+                change.get("number"),
+            )
+
+            item["hold_status"] = "failed"
+
+            update_failures.append({
+                "number": change.get("number"),
+                "status": "hold_update_failed",
+            })
 
         if classification == "high":
             high_risk_changes.append(item)
@@ -559,3 +663,64 @@ async def gemini_request_with_retry(
             await asyncio.sleep(interval)
 
     raise RuntimeError("Gemini retry loop ended unexpectedly.")
+
+
+
+async def put_change_on_hold(change: dict):
+    """Place a scheduled change on hold without changing its state."""
+
+    sys_id = change.get("sys_id")
+    current_state = str(change.get("state", "")).strip().lower()
+
+    already_on_hold = (
+        str(change.get("on_hold", "false")).strip().lower() == "true"
+    )
+
+    if current_state != "scheduled":
+        return {
+            "sys_id": sys_id,
+            "status": "skipped",
+            "reason": "Change is not in Scheduled state.",
+        }
+
+    if already_on_hold:
+        return {
+            "sys_id": sys_id,
+            "status": "already_on_hold",
+            "reason": "Change is already on hold.",
+        }
+
+    if not all([SNOW_INSTANCE_URL, SNOW_USERNAME, SNOW_PASSWORD]):
+        raise RuntimeError("ServiceNow configuration is incomplete.")
+
+    url = (
+        f"{SNOW_INSTANCE_URL}/api/now/table/"
+        f"change_request/{sys_id}"
+    )
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await snow_request_with_retry(
+            client,
+            "PATCH",
+            url,
+            auth=(SNOW_USERNAME, SNOW_PASSWORD),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={
+                "on_hold": True,
+                "on_hold_reason": (
+                    "Storm Mode: implementation temporarily suspended "
+                    "due to severe weather."
+                ),
+            },
+        )
+        response.raise_for_status()
+
+    return {
+        "sys_id": sys_id,
+        "status": "updated",
+        "on_hold": True,
+        "state": "Scheduled",
+    }

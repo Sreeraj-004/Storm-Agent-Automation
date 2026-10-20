@@ -634,6 +634,7 @@ async def close_storm_mode(alert_id: str):
 
             changes = response.json().get("result", [])
 
+            
             for change in changes:
                 change_number = change.get("number")
                 sys_id = change.get("sys_id")
@@ -648,7 +649,9 @@ async def close_storm_mode(alert_id: str):
                     continue
 
                 try:
-                    update_response = await client.patch(
+                    update_response = await snow_request_with_retry(
+                        client,
+                        "PATCH",
                         f"{url}/{sys_id}",
                         auth=(SNOW_USERNAME, SNOW_PASSWORD),
                         headers={
@@ -657,33 +660,31 @@ async def close_storm_mode(alert_id: str):
                         },
                         json={
                             "work_notes": close_note,
+                            "on_hold": False,
                         },
                     )
 
-                    if update_response.is_success:
-                        results["success_count"] += 1
-                        results["changes"].append({
-                            "number": change_number,
-                            "status": "success",
-                        })
-                    else:
-                        results["failed_count"] += 1
-                        results["changes"].append({
-                            "number": change_number,
-                            "status": "failed",
-                            "error": (
-                                f"ServiceNow returned HTTP "
-                                f"{update_response.status_code}."
-                            ),
-                        })
+                    results["success_count"] += 1
+                    results["changes"].append({
+                        "number": change_number,
+                        "status": "success",
+                        "work_note": "added",
+                        "hold_released": True,
+                    })
 
-                except httpx.RequestError:
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to update change %s while closing Storm Mode",
+                        change_number,
+                    )
+
                     results["failed_count"] += 1
                     results["changes"].append({
                         "number": change_number,
                         "status": "failed",
-                        "error": "Unable to connect to ServiceNow.",
+                        "error": str(exc),
                     })
+
 
     except httpx.HTTPStatusError as exc:
         logger.error(
