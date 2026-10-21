@@ -994,7 +994,7 @@ async function decideException(change, decision) {
                         key={`${change.alert_id}-${change.sys_id}`}
                       >
                         <h3>
-                          {change.number} — {change.short_description}
+                          {change.number} {change.short_description}
                         </h3>
 
                         <p>
@@ -1041,7 +1041,11 @@ async function decideException(change, decision) {
                             >
                               Reject Exception
                             </button>
+                            <p>
+                          Request will be auto rejected in 24 hours
+                        </p>
                           </div>
+                          
                         )}
                       </article>
                     ))}
