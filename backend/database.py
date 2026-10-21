@@ -37,6 +37,7 @@ def init_db():
                 alert_id TEXT NOT NULL,
                 sys_id TEXT NOT NULL,
                 change_number TEXT,
+                short_description TEXT,
                 assessment_json TEXT NOT NULL,
                 work_note_status TEXT NOT NULL DEFAULT 'pending',
                 exception_status TEXT NOT NULL DEFAULT 'not_required',
@@ -159,6 +160,7 @@ def list_assessments(alert_id):
 
     return result
 
+
 def list_exception_assessments(alert_id=None):
     with get_connection() as conn:
         if alert_id:
@@ -185,6 +187,13 @@ def list_exception_assessments(alert_id=None):
         item["risk_assessment"] = json.loads(
             item.pop("assessment_json")
         )
+
+        # Match the field names expected by the frontend.
+        item["number"] = item.get("change_number")
+        item["short_description"] = item.get(
+            "short_description", ""
+        )
+
         result.append(item)
 
     return result

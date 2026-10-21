@@ -10,6 +10,7 @@ r = httpx.get(
     auth=(USER, PASS),
     headers={"Accept": "application/json"},
     timeout=30,
+    verify=False,
 )
 print(r.status_code)
 print(r.headers)

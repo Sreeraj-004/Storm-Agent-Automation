@@ -139,7 +139,7 @@ async def apply_change_freeze(start: datetime, end: datetime):
     results = []
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
             # Retrieve changes overlapping the storm window.
             response = await snow_request_with_retry(
                 client,

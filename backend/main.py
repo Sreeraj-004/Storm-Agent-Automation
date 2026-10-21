@@ -101,6 +101,7 @@ async def get_merrillville_alerts():
     async with httpx.AsyncClient(
         timeout=20.0,
         headers=NWS_HEADERS,
+        verify=False,
     ) as client:
         try:
             response = await client.get(
@@ -278,6 +279,7 @@ async def get_scheduled_changes(
         async with httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=False,
+            verify=False,
         ) as client:
             response = await client.get(
                 url,
@@ -392,6 +394,7 @@ async def decide_storm_mode(
 }
 
 
+
 @app.get("/storm-mode/exceptions")
 async def get_change_exceptions(
     alert_id: str | None = None,
@@ -401,13 +404,24 @@ async def get_change_exceptions(
 
     if status:
         exceptions = [
-            item for item in exceptions
+            item
+            for item in exceptions
             if item.get("exception_status") == status
         ]
 
     return {
         "count": len(exceptions),
-        "exceptions": exceptions,
+        "exceptions": [
+            {
+                **item,
+                "number": item.get("number", "Unknown"),
+                "short_description": item.get(
+                    "short_description",
+                    "No description available",
+                ),
+            }
+            for item in exceptions
+        ],
     }
 
 @app.post(
@@ -621,6 +635,7 @@ async def close_storm_mode(alert_id: str):
         async with httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=False,
+            verify=False,
         ) as client:
 
             response = await client.get(
